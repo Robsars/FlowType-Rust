@@ -9,7 +9,8 @@ use std::time::Duration;
 use log::{info, error};
 mod settings;
 
-use std::sync::{Arc, atomic::{AtomicBool}};
+use std::sync::{Arc, atomic::{AtomicBool}, RwLock};
+use std::collections::HashMap;
 use std::thread;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -37,8 +38,6 @@ struct TranscriptionPayload {
 pub fn start_engine(app: AppHandle) -> Result<()> {
     info!("Starting FlowType Engine...");
 
-    // 1. Prepare Model (Blocking download - might delay startup, ideal to move to async command or separate thread)
-    // For now, we do it in a thread to avoid blocking main loop
     thread::spawn(move || {
         if let Err(e) = run_engine_loop(app) {
             error!("Engine crashed: {}", e);
@@ -55,8 +54,8 @@ fn run_engine_loop(app: AppHandle) -> Result<()> {
     info!("Loaded Settings: {:?}", saved_settings);
 
     // 2. Prepare Model
-    let model_mgr = ModelManager::new();
-    let model_path = model_mgr.get_or_download_model("tiny.en")?; 
+    let model_mgr = ModelManager::new(&app);
+    let model_path = model_mgr.get_or_download_model("tiny.en")?;  
 
     // 3. Setup Channels
     let (tx_audio, rx_audio) = crossbeam_channel::unbounded::<Vec<f32>>();
@@ -77,8 +76,16 @@ fn run_engine_loop(app: AppHandle) -> Result<()> {
     let allow_commands_clone = allow_commands.clone();
     app.manage(allow_commands.clone());
 
+    let disable_punctuation = Arc::new(AtomicBool::new(saved_settings.disable_punctuation));
+    let disable_punctuation_clone = disable_punctuation.clone();
+    app.manage(disable_punctuation.clone());
+
+    let shortcuts = Arc::new(RwLock::new(saved_settings.shortcuts));
+    let shortcuts_clone = shortcuts.clone();
+    app.manage(shortcuts.clone());
+
     // 4. Injector Thread
-    let app_handle_inj = app.clone(); // Clone for injector thread
+    let app_handle_inj = app.clone(); 
     thread::spawn(move || {
         let injector = match TextInjector::new() {
             Ok(i) => i,
@@ -93,12 +100,15 @@ fn run_engine_loop(app: AppHandle) -> Result<()> {
                 text.push(' ');
             }
 
-            // Emit to frontend
+            // Emit to frontend (Raw text before injection logic potentially changes it)
             app_handle_inj.emit("transcription", TranscriptionPayload { text: text.clone() }).ok();
             
             // Inject to OS
             let commands_enabled = allow_commands_clone.load(std::sync::atomic::Ordering::Relaxed);
-            if let Err(e) = injector.inject(&text, commands_enabled) {
+            let punctuations_disabled = disable_punctuation_clone.load(std::sync::atomic::Ordering::Relaxed);
+            let current_shortcuts = shortcuts_clone.read().unwrap();
+
+            if let Err(e) = injector.inject(&text, commands_enabled, &current_shortcuts, punctuations_disabled) {
                 error!("Injection failed: {}", e);
             }
         }
@@ -131,17 +141,16 @@ fn run_engine_loop(app: AppHandle) -> Result<()> {
         (source_rate as u64 * FRAME_SIZE_MS / 1000) as usize
     )?;
 
-    // 8. VAD (Increased sensitivity: 0.015 -> 0.008)
+    // 8. VAD
     let mut vad = EnergyVad::new(0.008, 0.005, 300, 500, FRAME_SIZE_MS);
-    let mut current_timeout = saved_settings.silence_timeout; // Use saved timeout
+    let mut current_timeout = saved_settings.silence_timeout; 
 
     // 9. Loop
     let chunk_samples = (source_rate as u64 * FRAME_SIZE_MS / 1000) as usize; 
     let mut buffer = Vec::with_capacity(chunk_samples);
     let mut voice_buffer = Vec::<f32>::new();
     
-    // Pre-roll buffer (500ms) to catch the start of sentences
-    let pre_roll_frames = (0.5 * 1000.0 / FRAME_SIZE_MS as f32) as usize; // ~16 chunks
+    let pre_roll_frames = (0.5 * 1000.0 / FRAME_SIZE_MS as f32) as usize; 
     let mut pre_roll_buffer = std::collections::VecDeque::<Vec<f32>>::with_capacity(pre_roll_frames);
 
     let mut last_state = VadState::Silence;
@@ -168,7 +177,6 @@ fn run_engine_loop(app: AppHandle) -> Result<()> {
              let rms = EnergyVad::calculate_rms(&buffer);
              let state = vad.process(rms);
 
-             // Maintain pre-roll buffer during silence
              if matches!(state, VadState::Silence) {
                  if pre_roll_buffer.len() >= pre_roll_frames {
                      pre_roll_buffer.pop_front();
@@ -176,21 +184,18 @@ fn run_engine_loop(app: AppHandle) -> Result<()> {
                  pre_roll_buffer.push_back(buffer.clone());
              }
 
-             // State Transition: Silence -> Speaking
              if matches!(last_state, VadState::Silence) && matches!(state, VadState::Speaking) {
                  info!("🗣️ Speech started! Prepending {}ms of audio", pre_roll_buffer.len() as u64 * FRAME_SIZE_MS);
-                 // Dump pre-roll into voice buffer
                  for chunk in pre_roll_buffer.iter() {
                      voice_buffer.extend_from_slice(chunk);
                  }
-                 pre_roll_buffer.clear(); // Clear to avoid duplicating if we toggle rapidly
+                 pre_roll_buffer.clear(); 
              }
 
              if matches!(state, VadState::Speaking) {
                  voice_buffer.extend_from_slice(&buffer);
              } 
              
-             // State Transition: Speaking -> Silence
              if matches!(last_state, VadState::Speaking) && matches!(state, VadState::Silence) {
                  if !voice_buffer.is_empty() {
                      info!("🗣️ Speech ended. Resampling {} samples...", voice_buffer.len());
@@ -227,8 +232,6 @@ fn discriminant<T>(v: &T) -> std::mem::Discriminant<T> {
 #[tauri::command]
 fn set_auto_space(state: bool, auto_space: tauri::State<'_, Arc<AtomicBool>>, app: tauri::AppHandle) {
     auto_space.store(state, std::sync::atomic::Ordering::Relaxed);
-    info!("Auto-space set to: {}", state);
-    
     let mgr = settings::SettingsManager::new(&app);
     let mut current = mgr.load();
     current.auto_space = state;
@@ -238,7 +241,6 @@ fn set_auto_space(state: bool, auto_space: tauri::State<'_, Arc<AtomicBool>>, ap
 #[tauri::command]
 fn set_silence_timeout(ms: u64, timeout: tauri::State<'_, Arc<std::sync::atomic::AtomicU64>>, app: tauri::AppHandle) {
     timeout.store(ms, std::sync::atomic::Ordering::Relaxed);
-    
     let mgr = settings::SettingsManager::new(&app);
     let mut current = mgr.load();
     current.silence_timeout = ms;
@@ -248,11 +250,41 @@ fn set_silence_timeout(ms: u64, timeout: tauri::State<'_, Arc<std::sync::atomic:
 #[tauri::command]
 fn set_allow_commands(state: bool, allow_commands: tauri::State<'_, Arc<AtomicBool>>, app: tauri::AppHandle) {
     allow_commands.store(state, std::sync::atomic::Ordering::Relaxed);
-    info!("Voice Commands set to: {}", state);
-
     let mgr = settings::SettingsManager::new(&app);
     let mut current = mgr.load();
     current.allow_commands = state;
+    mgr.save(&current);
+}
+
+#[tauri::command]
+fn set_disable_punctuation(state: bool, disable_punctuation: tauri::State<'_, Arc<AtomicBool>>, app: tauri::AppHandle) {
+    disable_punctuation.store(state, std::sync::atomic::Ordering::Relaxed);
+    info!("Disable Punctuation set to: {}", state);
+    let mgr = settings::SettingsManager::new(&app);
+    let mut current = mgr.load();
+    current.disable_punctuation = state;
+    mgr.save(&current);
+}
+
+#[tauri::command]
+fn upsert_shortcut(key: String, value: String, shortcuts: tauri::State<'_, Arc<RwLock<HashMap<String, String>>>>, app: tauri::AppHandle) {
+    let mut current_shortcuts = shortcuts.write().unwrap();
+    current_shortcuts.insert(key.to_lowercase(), value);
+    
+    let mgr = settings::SettingsManager::new(&app);
+    let mut current = mgr.load();
+    current.shortcuts = current_shortcuts.clone();
+    mgr.save(&current);
+}
+
+#[tauri::command]
+fn delete_shortcut(key: String, shortcuts: tauri::State<'_, Arc<RwLock<HashMap<String, String>>>>, app: tauri::AppHandle) {
+    let mut current_shortcuts = shortcuts.write().unwrap();
+    current_shortcuts.remove(&key.to_lowercase());
+    
+    let mgr = settings::SettingsManager::new(&app);
+    let mut current = mgr.load();
+    current.shortcuts = current_shortcuts.clone();
     mgr.save(&current);
 }
 
@@ -270,14 +302,15 @@ pub fn run() {
         set_auto_space, 
         set_silence_timeout, 
         set_allow_commands,
+        set_disable_punctuation,
+        upsert_shortcut,
+        delete_shortcut,
         get_settings
     ])
     .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--minimized"])))
     .plugin(tauri_plugin_log::Builder::default().build())
     .setup(|app| {
-        // Start the engine
         let handle = app.handle().clone();
-        // Spawning separate thread for engine allows setup to complete
         start_engine(handle)?;
         Ok(())
     })

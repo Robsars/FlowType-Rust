@@ -38,7 +38,7 @@ reqwest = { version = "0.11", features = ["blocking", "rustls-tls"] }
 arboard = "3.2"
 whisper-rs = "0.13"
 
-[dependencies.windows]
+[target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.48"
 features = [
     "Win32_Foundation",
@@ -48,3 +48,6 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+enigo = "0.2"

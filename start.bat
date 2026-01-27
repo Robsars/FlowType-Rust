@@ -5,12 +5,24 @@ echo 🚀 Starting FlowType Environment...
 
 :: Set LLVM path for Whisper compilation
 set LIBCLANG_PATH=C:\Program Files\LLVM\bin
-echo ✅ LIBCLANG_PATH set to %LIBCLANG_PATH%
+
+if exist "%LIBCLANG_PATH%" (
+    echo ✅ LIBCLANG_PATH set to %LIBCLANG_PATH%
+) else (
+    echo ⚠️ WARNING: LLVM not found at %LIBCLANG_PATH%
+    echo 💡 Please ensure LLVM is installed. See README.md for help.
+)
+
+:: Install root dependencies if needed
+if not exist "node_modules" (
+    echo 📦 Installing root dependencies...
+    npm install
+)
 
 :: Install UI dependencies if needed
 if not exist "ui\node_modules" (
     echo 📦 Installing UI dependencies...
-    cd ui && npm install && cd ..
+    npm install --prefix ui
 )
 
 :: Run Tauri dev (handles frontend and backend)

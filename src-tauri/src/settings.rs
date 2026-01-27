@@ -4,20 +4,33 @@ use std::path::PathBuf;
 use tauri::AppHandle;
 use tauri::Manager;
 use log::{info, error};
+use std::collections::HashMap;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppSettings {
     pub auto_space: bool,
     pub silence_timeout: u64,
     pub allow_commands: bool,
+    pub disable_punctuation: bool,
+    pub shortcuts: HashMap<String, String>,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
+        let mut shortcuts = HashMap::new();
+        shortcuts.insert("delete".to_string(), "[BACKSPACE]".to_string());
+        shortcuts.insert("backspace".to_string(), "[BACKSPACE]".to_string());
+        shortcuts.insert("delete that".to_string(), "[DELETE_LINE]".to_string());
+        shortcuts.insert("new line".to_string(), "[ENTER]".to_string());
+        shortcuts.insert("enter".to_string(), "[ENTER]".to_string());
+        shortcuts.insert("space".to_string(), " ".to_string());
+        
         Self {
             auto_space: true,
             silence_timeout: 500,
             allow_commands: true,
+            disable_punctuation: false,
+            shortcuts,
         }
     }
 }

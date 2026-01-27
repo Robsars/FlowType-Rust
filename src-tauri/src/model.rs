@@ -1,41 +1,54 @@
+
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::io::copy;
 use log::info;
+use tauri::{AppHandle, Manager};
 
 pub struct ModelManager {
-    model_dir: PathBuf,
+    app: AppHandle,
 }
 
 impl ModelManager {
-    pub fn new() -> Self {
-        let model_dir = std::env::current_dir()
+    pub fn new(app: &AppHandle) -> Self {
+        Self { app: app.clone() }
+    }
+
+    /// Returns the path to the requested model.
+    /// Priority: 1. Bundled Resource, 2. Local File, 3. Download
+    pub fn get_or_download_model(&self, model_name: &str) -> Result<PathBuf> {
+        let file_name = format!("ggml-{}.bin", model_name);
+
+        // 1. Check Bundled Resources
+        if let Ok(resource_dir) = self.app.path().resource_dir() {
+            let bundled_path = resource_dir.join("models").join(&file_name);
+            if bundled_path.exists() {
+                info!("Using bundled model: {:?}", bundled_path);
+                return Ok(bundled_path);
+            }
+        }
+
+        // 2. Check Local Directory (typical for dev environment)
+        let local_dir = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("models");
         
-        Self { model_dir }
-    }
-
-    /// Returns the path to the requested model, downloading it if necessary.
-    /// Default suggested: "distil-medium.en" or "base.en"
-    pub fn get_or_download_model(&self, model_name: &str) -> Result<PathBuf> {
-        if !self.model_dir.exists() {
-            fs::create_dir_all(&self.model_dir).context("Failed to create models directory")?;
+        if !local_dir.exists() {
+            fs::create_dir_all(&local_dir).context("Failed to create models directory")?;
         }
 
-        let file_name = format!("ggml-{}.bin", model_name);
-        let model_path = self.model_dir.join(&file_name);
-
-        if model_path.exists() {
-            info!("Model located at: {:?}", model_path);
-            return Ok(model_path);
+        let local_path = local_dir.join(&file_name);
+        if local_path.exists() {
+            info!("Using local model: {:?}", local_path);
+            return Ok(local_path);
         }
 
+        // 3. Download
         info!("Model '{}' not found. Downloading...", model_name);
-        self.download_model(model_name, &model_path)?;
+        self.download_model(model_name, &local_path)?;
         
-        Ok(model_path)
+        Ok(local_path)
     }
 
     fn download_model(&self, name: &str, dest: &Path) -> Result<()> {

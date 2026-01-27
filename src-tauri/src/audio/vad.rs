@@ -1,10 +1,6 @@
 use std::collections::VecDeque;
 
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub enum VadAction {
-    Silence,
-    Speaking,
-}
+
 
 #[derive(Debug, Clone, Copy)]
 pub enum VadState {

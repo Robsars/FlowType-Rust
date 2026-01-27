@@ -15,10 +15,13 @@ interface AppSettings {
   auto_space: boolean;
   silence_timeout: number;
   allow_commands: boolean;
+  disable_punctuation: boolean;
+  shortcuts: Record<string, string>;
 }
 
 import { invoke } from "@tauri-apps/api/core";
 import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
+import { ShortcutsModal } from "./ShortcutsModal";
 
 function App() {
   const [vadState, setVadState] = useState<"speaking" | "silence">("silence");
@@ -30,8 +33,11 @@ function App() {
   const [silenceTimeout, setSilenceTimeout] = useState(500);
   const [autostart, setAutostart] = useState(false);
   const [allowCommands, setAllowCommands] = useState(true);
+  const [disablePunctuation, setDisablePunctuation] = useState(false);
+  const [shortcuts, setShortcuts] = useState<Record<string, string>>({});
 
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
 
   const minimize = () => {
     invoke("minimize_window");
@@ -47,6 +53,12 @@ function App() {
     const newVal = e.target.checked;
     setAllowCommands(newVal);
     invoke("set_allow_commands", { state: newVal });
+  };
+
+  const handleTogglePunctuation = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const newVal = e.target.checked;
+    setDisablePunctuation(newVal);
+    invoke("set_disable_punctuation", { state: newVal });
   };
 
   const handleTimeoutChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -72,6 +84,8 @@ function App() {
       setAutoSpace(settings.auto_space);
       setSilenceTimeout(settings.silence_timeout);
       setAllowCommands(settings.allow_commands);
+      setDisablePunctuation(settings.disable_punctuation);
+      setShortcuts(settings.shortcuts);
     });
 
     // Check initial autostart status
@@ -131,23 +145,38 @@ function App() {
 
             <div className="setting-item">
               <label>
+                <input type="checkbox" checked={disablePunctuation} onChange={handleTogglePunctuation} />
+                Disable Punctuation
+              </label>
+            </div>
+
+            <div className="setting-item">
+              <label>
                 <input type="checkbox" checked={autostart} onChange={handleToggleAutostart} />
-                Start with Windows
+                Start with OS
               </label>
             </div>
 
             <div className="setting-item">
               <label>
                 <input type="checkbox" checked={allowCommands} onChange={handleToggleCommands} />
-                Voice Commands
-                <div className="tooltip">(delete, period, backspace, space, delete that)</div>
+                Voice Commands & Shortcuts
               </label>
+              <button className="shortcut-mgr-btn" onClick={() => setShortcutsOpen(true)}>Manage Shortcuts ({Object.keys(shortcuts).length})</button>
             </div>
           </div>
         </div>
       )}
 
-      {!settingsOpen && (
+      {shortcutsOpen && (
+        <ShortcutsModal
+          shortcuts={shortcuts}
+          onClose={() => setShortcutsOpen(false)}
+          onUpdate={setShortcuts}
+        />
+      )}
+
+      {!settingsOpen && !shortcutsOpen && (
         <>
           <div className="main-display">
             <h1>{lastText || "Start speaking..."}</h1>
