@@ -100,12 +100,36 @@ fn run_engine_loop(app: AppHandle) -> Result<()> {
                 text.push(' ');
             }
 
-            // Emit to frontend (Raw text before injection logic potentially changes it)
+            // Check punctuation filtering EARLY (before display and injection)
+            let punctuations_disabled = disable_punctuation_clone.load(std::sync::atomic::Ordering::Relaxed);
+            if punctuations_disabled {
+                // Replace punctuation with spaces (to maintain word separation)
+                text = text.chars()
+                    .map(|c| if c.is_ascii_punctuation() { ' ' } else { c })
+                    .collect();
+                // Normalize multiple spaces to single space and trim
+                let mut result = String::with_capacity(text.len());
+                let mut last_was_space = false;
+                for c in text.chars() {
+                    if c == ' ' {
+                        if !last_was_space {
+                            result.push(c);
+                        }
+                        last_was_space = true;
+                    } else {
+                        result.push(c);
+                        last_was_space = false;
+                    }
+                }
+                text = result.trim().to_string();
+                info!("Punctuation replaced with spaces: '{}'", text);
+            }
+
+            // Emit to frontend (now shows filtered text if punctuation is disabled)
             app_handle_inj.emit("transcription", TranscriptionPayload { text: text.clone() }).ok();
             
             // Inject to OS
             let commands_enabled = allow_commands_clone.load(std::sync::atomic::Ordering::Relaxed);
-            let punctuations_disabled = disable_punctuation_clone.load(std::sync::atomic::Ordering::Relaxed);
             let current_shortcuts = shortcuts_clone.read().unwrap();
 
             if let Err(e) = injector.inject(&text, commands_enabled, &current_shortcuts, punctuations_disabled) {
