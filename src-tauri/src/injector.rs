@@ -66,8 +66,16 @@ mod platform {
                 if let Ok(_) = self.inject_uia_value(&text_to_inject) { return Ok(()); }
             }
 
-            if let Ok(_) = self.inject_keyboard_unicode(&text_to_inject) { return Ok(()); }
-            self.inject_clipboard(&text_to_inject)
+            // Before falling back to keyboard injection, check if we're in an editable element
+            // This prevents scrolling in browsers when focus is not in a text field
+            if target_is_vscode || self.is_editable_element() {
+                if let Ok(_) = self.inject_keyboard_unicode(&text_to_inject) { return Ok(()); }
+                self.inject_clipboard(&text_to_inject)
+            } else {
+                // Not in an editable element - skip injection to prevent unwanted behavior
+                info!("Skipping injection: focus is not in an editable text field");
+                Ok(())
+            }
         }
 
         fn is_vscode_focused(&self) -> bool {
@@ -82,6 +90,29 @@ mod platform {
                 } else {
                     false
                 }
+            }
+        }
+
+        /// Check if the focused element is an editable text field using UI Automation.
+        /// Returns true if the element supports text input (ValuePattern or TextPattern),
+        /// false otherwise (e.g., browser page, button, etc.)
+        fn is_editable_element(&self) -> bool {
+            unsafe {
+                let Some(auto) = self.automation.as_ref() else { return false; };
+                
+                let Ok(element) = auto.GetFocusedElement() else { return false; };
+                
+                // Check if element supports ValuePattern (common for input fields)
+                if element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId).is_ok() {
+                    return true;
+                }
+                
+                // Check if element supports TextPattern (for rich text editors)
+                if element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId).is_ok() {
+                    return true;
+                }
+                
+                false
             }
         }
 

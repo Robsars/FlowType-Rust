@@ -52,11 +52,13 @@ impl TranscriptionEngine {
                 }
 
                 // Extract Text
-                let num_segments = state.full_n_segments().unwrap_or(0);
+                let num_segments = state.full_n_segments();
                 let mut full_text = String::new();
                 for i in 0..num_segments {
-                    if let Ok(segment) = state.full_get_segment_text(i) {
-                         full_text.push_str(&segment);
+                    if let Some(segment) = state.get_segment(i) {
+                        if let Ok(text) = segment.to_str() {
+                            full_text.push_str(text);
+                        }
                     }
                 }
 
