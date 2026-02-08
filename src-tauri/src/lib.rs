@@ -20,6 +20,11 @@ use model::ModelManager;
 use transcription::TranscriptionEngine;
 use injector::TextInjector;
 
+// Newtype wrappers for Tauri state (each needs unique type to avoid collision)
+struct AutoSpaceState(Arc<AtomicBool>);
+struct AllowCommandsState(Arc<AtomicBool>);
+struct DisablePunctuationState(Arc<AtomicBool>);
+
 const SAMPLE_RATE: u32 = 16000; 
 const FRAME_SIZE_MS: u64 = 30;  
 const RINGBUF_SIZE: usize = 16000 * 10; 
@@ -66,7 +71,7 @@ fn run_engine_loop(app: AppHandle) -> Result<()> {
     
     let auto_space = Arc::new(AtomicBool::new(saved_settings.auto_space)); 
     let auto_space_clone = auto_space.clone();
-    app.manage(auto_space.clone());
+    app.manage(AutoSpaceState(auto_space.clone()));
 
     let silence_timeout = Arc::new(std::sync::atomic::AtomicU64::new(saved_settings.silence_timeout)); 
     let silence_timeout_clone = silence_timeout.clone();
@@ -74,11 +79,11 @@ fn run_engine_loop(app: AppHandle) -> Result<()> {
 
     let allow_commands = Arc::new(AtomicBool::new(saved_settings.allow_commands)); 
     let allow_commands_clone = allow_commands.clone();
-    app.manage(allow_commands.clone());
+    app.manage(AllowCommandsState(allow_commands.clone()));
 
     let disable_punctuation = Arc::new(AtomicBool::new(saved_settings.disable_punctuation));
     let disable_punctuation_clone = disable_punctuation.clone();
-    app.manage(disable_punctuation.clone());
+    app.manage(DisablePunctuationState(disable_punctuation.clone()));
 
     let shortcuts = Arc::new(RwLock::new(saved_settings.shortcuts));
     let shortcuts_clone = shortcuts.clone();
@@ -102,6 +107,7 @@ fn run_engine_loop(app: AppHandle) -> Result<()> {
 
             // Check punctuation filtering EARLY (before display and injection)
             let punctuations_disabled = disable_punctuation_clone.load(std::sync::atomic::Ordering::Relaxed);
+            info!("🔧 Punctuation filter state: {} (text before filter: '{}')", punctuations_disabled, text);
             if punctuations_disabled {
                 // Replace punctuation with spaces (to maintain word separation)
                 text = text.chars()
@@ -254,8 +260,8 @@ fn discriminant<T>(v: &T) -> std::mem::Discriminant<T> {
 }
 
 #[tauri::command]
-fn set_auto_space(state: bool, auto_space: tauri::State<'_, Arc<AtomicBool>>, app: tauri::AppHandle) {
-    auto_space.store(state, std::sync::atomic::Ordering::Relaxed);
+fn set_auto_space(state: bool, auto_space: tauri::State<'_, AutoSpaceState>, app: tauri::AppHandle) {
+    auto_space.0.store(state, std::sync::atomic::Ordering::Relaxed);
     let mgr = settings::SettingsManager::new(&app);
     let mut current = mgr.load();
     current.auto_space = state;
@@ -272,8 +278,8 @@ fn set_silence_timeout(ms: u64, timeout: tauri::State<'_, Arc<std::sync::atomic:
 }
 
 #[tauri::command]
-fn set_allow_commands(state: bool, allow_commands: tauri::State<'_, Arc<AtomicBool>>, app: tauri::AppHandle) {
-    allow_commands.store(state, std::sync::atomic::Ordering::Relaxed);
+fn set_allow_commands(state: bool, allow_commands: tauri::State<'_, AllowCommandsState>, app: tauri::AppHandle) {
+    allow_commands.0.store(state, std::sync::atomic::Ordering::Relaxed);
     let mgr = settings::SettingsManager::new(&app);
     let mut current = mgr.load();
     current.allow_commands = state;
@@ -281,8 +287,8 @@ fn set_allow_commands(state: bool, allow_commands: tauri::State<'_, Arc<AtomicBo
 }
 
 #[tauri::command]
-fn set_disable_punctuation(state: bool, disable_punctuation: tauri::State<'_, Arc<AtomicBool>>, app: tauri::AppHandle) {
-    disable_punctuation.store(state, std::sync::atomic::Ordering::Relaxed);
+fn set_disable_punctuation(state: bool, disable_punctuation: tauri::State<'_, DisablePunctuationState>, app: tauri::AppHandle) {
+    disable_punctuation.0.store(state, std::sync::atomic::Ordering::Relaxed);
     info!("Disable Punctuation set to: {}", state);
     let mgr = settings::SettingsManager::new(&app);
     let mut current = mgr.load();
