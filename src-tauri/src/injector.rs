@@ -13,6 +13,14 @@ mod platform {
         automation: Option<IUIAutomation>,
     }
 
+    #[derive(Debug)]
+    enum WindowContext {
+        VSCode,
+        GoogleDocs,
+        Browser,   // Chrome, Edge, Firefox, Opera, Brave, etc.
+        NativeApp, // Notepad, Word, etc.
+    }
+
     impl PlatformInjector {
         pub fn new() -> Result<Self> {
             unsafe {
@@ -26,9 +34,138 @@ mod platform {
             }
         }
 
+        // ============================================================
+        // Window Context Detection
+        // ============================================================
+        fn get_window_context(&self) -> WindowContext {
+            use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW};
+            unsafe {
+                let hwnd = GetForegroundWindow();
+                let mut buffer = [0u16; 512];
+                let len = GetWindowTextW(hwnd, &mut buffer);
+                if len > 0 {
+                    let title = String::from_utf16_lossy(&buffer[..len as usize]);
+                    let title_lower = title.to_lowercase().trim().to_string();
+                    
+                    info!("Window title: '{}'", title_lower);
+
+                    // VS Code / Antigravity
+                    if title.contains("Visual Studio Code") || title.contains("Antigravity") {
+                        return WindowContext::VSCode;
+                    }
+
+                    // Google Docs/Sheets/Slides (special canvas-based editor)
+                    if title_lower.contains("google docs") ||
+                       title_lower.contains("google sheets") ||
+                       title_lower.contains("google slides") {
+                        return WindowContext::GoogleDocs;
+                    }
+
+                    // Browser detection — use contains() to handle trailing whitespace/chars
+                    // Covers all major Chromium-based and non-Chromium browsers
+                    if title_lower.contains("- google chrome") ||
+                       title_lower.contains("- microsoft edge") ||
+                       title_lower.contains("- mozilla firefox") ||
+                       title_lower.contains("- firefox") ||
+                       title_lower.contains("- opera") ||
+                       title_lower.contains("- brave") ||
+                       title_lower.contains("- vivaldi") ||
+                       title_lower.contains("- arc") {
+                        return WindowContext::Browser;
+                    }
+                }
+
+                WindowContext::NativeApp
+            }
+        }
+
+        // ============================================================
+        // Universal Text-Field Detection
+        // ============================================================
+
+        /// Determine if the UIA focused element is a genuine text input field.
+        /// This is the UNIVERSAL GATE for ALL injection (browsers AND native apps).
+        /// Only VS Code and Google Docs bypass this check.
+        ///
+        /// Accepts:
+        ///   • Control type 50004 (Edit)            – <input>, <textarea>, Notepad, etc.
+        ///   • Control type 50025 (Document) IF writable AND has editor-like name
+        ///
+        /// Rejects EVERYTHING else — file lists, toolbars, browser viewports, menus, etc.
+        fn is_text_field(&self) -> bool {
+            unsafe {
+                let Some(auto) = self.automation.as_ref() else { return false; };
+                let Ok(element) = auto.GetFocusedElement() else { return false; };
+
+                let name = element.CurrentName().map(|b| b.to_string()).unwrap_or_default();
+                let name_lower = name.to_lowercase();
+                let control_type = element.CurrentControlType().ok();
+                let class_name = element.CurrentClassName().map(|b| b.to_string()).unwrap_or_default();
+                let is_kbd_focusable = element.CurrentIsKeyboardFocusable().map(|b| b.as_bool()).unwrap_or(false);
+
+                info!(
+                    "Focused element: Name='{}', TypeID={:?}, Class='{}', KbdFocus={}",
+                    name, control_type, class_name, is_kbd_focusable
+                );
+
+                // Not keyboard focusable → can't type here
+                if !is_kbd_focusable {
+                    info!("  → Not keyboard focusable → reject");
+                    return false;
+                }
+
+                if let Some(ct) = control_type {
+                    match ct.0 {
+                        // ── Edit (50004) ─────────────────────────────────
+                        // Notepad text area, browser <input>, <textarea>, etc.
+                        50004 => {
+                            info!("  → Edit control (50004) → accept");
+                            return true;
+                        }
+                        // ── Document (50025) ────────────────────────────
+                        // Could be contenteditable div, Word doc, or browser page body.
+                        // Require writable ValuePattern + editor-like naming.
+                        50025 => {
+                            if let Ok(vp) = element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) {
+                                let read_only = vp.CurrentIsReadOnly().map(|b| b.as_bool()).unwrap_or(true);
+                                if !read_only {
+                                    let is_editor =
+                                        name_lower.contains("editor") ||
+                                        name_lower.contains("compose") ||
+                                        name_lower.contains("message body") ||
+                                        name_lower.contains("rich text") ||
+                                        name_lower.contains("mail body") ||
+                                        name_lower.contains("editing");
+                                    if is_editor {
+                                        info!("  → Writable Document + editor name → accept");
+                                        return true;
+                                    }
+                                }
+                            }
+                            info!("  → Document without editor evidence → reject");
+                            return false;
+                        }
+                        // ── Everything else → reject ─────────────────────
+                        // ListItem (file explorer), Pane, Group, Button, etc.
+                        other => {
+                            info!("  → Control type {} → reject (not Edit/Document)", other);
+                            return false;
+                        }
+                    }
+                }
+
+                info!("  → Unknown control type → reject");
+                false
+            }
+        }
+
+        // ============================================================
+        // Main injection entry-point
+        // ============================================================
+
         pub fn inject(&self, text: &str, allow_commands: bool, shortcuts: &HashMap<String, String>, disable_punctuation: bool) -> Result<()> {
             if text.is_empty() { return Ok(()); }
-            
+
             let mut text_to_inject = text.to_string();
 
             // 1. Punctuation removal
@@ -38,20 +175,29 @@ mod platform {
 
             info!("Injecting (Windows): '{}' (commands: {})", text_to_inject, allow_commands);
 
-            // 2. Shortcut/Command Handling
+            // 2. Determine window context ONCE
+            let ctx = self.get_window_context();
+            info!("Window context: {:?}", ctx);
+
+            // 3. Shortcut / command handling
             if allow_commands {
-                let clean = text_to_inject.trim().to_lowercase();
-                
-                // Check for dynamic shortcuts
+                let clean: String = text_to_inject
+                    .trim()
+                    .to_lowercase()
+                    .chars()
+                    .filter(|c| !c.is_ascii_punctuation())
+                    .collect();
+
+                info!("🎤 Command check: looking for '{}' in {} shortcuts", clean, shortcuts.len());
+
                 if let Some(result) = shortcuts.get(&clean) {
-                    info!("Shortcut triggered: '{}' -> '{}'", clean, result);
+                    info!("✅ Shortcut triggered: '{}' -> '{}'", clean, result);
                     match result.as_str() {
                         "[BACKSPACE]" => return self.send_key(windows::Win32::UI::Input::KeyboardAndMouse::VK_BACK),
-                        "[DELETE]" => return self.send_key(windows::Win32::UI::Input::KeyboardAndMouse::VK_DELETE),
-                        "[ENTER]" => return self.send_key(windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN),
+                        "[DELETE]"    => return self.send_key(windows::Win32::UI::Input::KeyboardAndMouse::VK_DELETE),
+                        "[ENTER]"     => return self.send_key(windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN),
                         "[DELETE_LINE]" => return self.delete_line(),
                         other => {
-                            // If it's just text (like an email), update text_to_inject and continue
                             text_to_inject = other.to_string();
                         }
                     }
@@ -60,198 +206,51 @@ mod platform {
 
             if text_to_inject.is_empty() { return Ok(()); }
 
-            let target_is_vscode = self.is_vscode_focused();
-            if !target_is_vscode {
-                if let Ok(_) = self.inject_uia_text(&text_to_inject) { return Ok(()); }
-                if let Ok(_) = self.inject_uia_value(&text_to_inject) { return Ok(()); }
-            }
-
-            // Before falling back to keyboard injection, check if we're in an editable element
-            // This prevents scrolling in browsers when focus is not in a text field
-            if target_is_vscode || self.is_editable_element() {
-                if let Ok(_) = self.inject_keyboard_unicode(&text_to_inject) { return Ok(()); }
-                self.inject_clipboard(&text_to_inject)
-            } else {
-                // Not in an editable element - skip injection to prevent unwanted behavior
-                info!("Skipping injection: focus is not in an editable text field");
-                Ok(())
-            }
-        }
-
-        fn is_vscode_focused(&self) -> bool {
-            use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW};
-            unsafe {
-                let hwnd = GetForegroundWindow();
-                let mut buffer = [0u16; 512];
-                let len = GetWindowTextW(hwnd, &mut buffer);
-                if len > 0 {
-                    let title = String::from_utf16_lossy(&buffer[..len as usize]);
-                    title.contains("Visual Studio Code") || title.contains("Antigravity")
-                } else {
-                    false
-                }
-            }
-        }
-
-        /// Check if the focused element is an editable text field using UI Automation.
-        /// Returns true ONLY if the element is a genuine text input field.
-        /// This is deliberately strict to prevent unwanted side effects like scrolling.
-        fn is_editable_element(&self) -> bool {
-            unsafe {
-                let Some(auto) = self.automation.as_ref() else { return false; };
-                
-                let Ok(element) = auto.GetFocusedElement() else { return false; };
-
-                // Gather diagnostic info
-                let name = element.CurrentName().map(|b| b.to_string()).unwrap_or_default();
-                let name_lower = name.to_lowercase();
-                let control_type = element.CurrentControlType().ok();
-                let class_name = element.CurrentClassName().map(|b| b.to_string()).unwrap_or_default();
-                let automation_id = element.CurrentAutomationId().map(|b| b.to_string()).unwrap_or_default();
-                
-                // Check keyboard focusability - critical for determining if we can type here
-                let is_keyboard_focusable = element.CurrentIsKeyboardFocusable().map(|b| b.as_bool()).unwrap_or(false);
-                
-                info!(
-                    "Focused Element: Name='{}', TypeID={:?}, ClassName='{}', AutomationId='{}', KeyboardFocusable={}",
-                    name, control_type, class_name, automation_id, is_keyboard_focusable
-                );
-
-                // ============================================================
-                // SPECIAL CASE DETECTION (checked FIRST - before rejection rules)
-                // These apps may not expose standard UIA properties correctly.
-                // ============================================================
-                
-                // Google Docs uses a canvas-based editor that may not report as keyboard focusable
-                if name_lower.contains("document content") || name_lower.contains("google docs") {
-                    info!("Accepting: Google Docs editor detected (special case)");
-                    return true;
+            // 4. Injection strategy — determined by window context
+            match ctx {
+                WindowContext::VSCode => {
+                    info!("📝 VS Code → keyboard injection");
+                    if let Ok(_) = self.inject_keyboard_unicode(&text_to_inject) { return Ok(()); }
+                    self.inject_clipboard(&text_to_inject)
                 }
 
-                // ============================================================
-                // REJECTION RULES (checked after special cases)
-                // ============================================================
-                
-                // Reject if not keyboard focusable (can't type into it anyway)
-                if !is_keyboard_focusable {
-                    info!("Skipping: Element is not keyboard focusable");
-                    return false;
+                WindowContext::GoogleDocs => {
+                    info!("📝 Google Docs → keyboard injection");
+                    if let Ok(_) = self.inject_keyboard_unicode(&text_to_inject) { return Ok(()); }
+                    self.inject_clipboard(&text_to_inject)
                 }
-                
-                // Reject known browser chrome/viewport classes that are NOT text inputs
-                let browser_non_edit_classes = [
-                    "Chrome_RenderWidgetHostHWND",  // Chrome main render area
-                    "MozillaWindowClass",            // Firefox window
-                    "Internet Explorer_Server",      // IE/Edge Legacy
-                    "CefBrowserWindow",              // CEF-based apps
-                ];
-                
-                for browser_class in browser_non_edit_classes {
-                    if class_name.contains(browser_class) {
-                        // Even if class matches browser, check if it's specifically an edit control
-                        if let Some(ct) = control_type {
-                            // 50004 = Edit, 50025 = Document (for contenteditable)
-                            if ct.0 != 50004 && ct.0 != 50025 {
-                                info!("Skipping: Browser viewport class '{}' with non-edit control type {:?}", class_name, ct);
-                                return false;
-                            }
-                        } else {
-                            info!("Skipping: Browser viewport class '{}' with unknown control type", class_name);
-                            return false;
-                        }
+
+                WindowContext::Browser => {
+                    // For ANY browser: only inject if we're in a real text field
+                    if self.is_text_field() {
+                        info!("📝 Browser text field → clipboard injection");
+                        self.inject_clipboard(&text_to_inject)
+                    } else {
+                        info!("🛑 Browser: not in text field → blocking injection");
+                        Ok(())
                     }
                 }
 
-                // ============================================================
-                // ACCEPTANCE RULES (in order of specificity)
-                // ============================================================
-                
-                // 2. Control Type Detection - strict whitelist
-                if let Some(ct) = control_type {
-                    match ct.0 {
-                        50004 => {
-                            // UIA_EditControlTypeId - this is definitely a text input
-                            info!("Accepting: Control type is Edit (50004)");
-                            return true;
-                        }
-                        50025 => {
-                            // UIA_DocumentControlTypeId - could be contenteditable
-                            // Only accept if it also has ValuePattern (editable)
-                            if element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId).is_ok() {
-                                info!("Accepting: Document control with ValuePattern (likely contenteditable)");
-                                return true;
-                            }
-                            // Check if it explicitly looks like an editor
-                            if name_lower.contains("editor") || name_lower.contains("compose") || name_lower.contains("message body") {
-                                info!("Accepting: Document control with editor-like name");
-                                return true;
-                            }
-                            info!("Skipping: Document control without edit capability indicators");
-                            return false;
-                        }
-                        50020 => {
-                            // UIA_PaneControlTypeId - generic pane, usually NOT editable
-                            // Exception: Some custom editors use Pane
-                            if name_lower.contains("editor") || name_lower.contains("input") {
-                                info!("Accepting: Pane control with editor-like name");
-                                return true;
-                            }
-                            info!("Skipping: Generic Pane control");
-                            return false;
-                        }
-                        50033 => {
-                            // UIA_GroupControlTypeId - groups are not editable
-                            info!("Skipping: Group control type");
-                            return false;
-                        }
-                        _ => {
-                            // Other control types - need more evidence
-                        }
+                WindowContext::NativeApp => {
+                    // Native apps: MUST also check if in a text field first!
+                    // Without this, File Explorer items get renamed, etc.
+                    if self.is_text_field() {
+                        info!("📝 Native text field → UIA/keyboard injection");
+                        if let Ok(_) = self.inject_uia_text(&text_to_inject) { return Ok(()); }
+                        if let Ok(_) = self.inject_uia_value(&text_to_inject) { return Ok(()); }
+                        if let Ok(_) = self.inject_keyboard_unicode(&text_to_inject) { return Ok(()); }
+                        self.inject_clipboard(&text_to_inject)
+                    } else {
+                        info!("🛑 Native app: not in text field → blocking injection");
+                        Ok(())
                     }
                 }
-                
-                // 3. ValuePattern check with additional validation
-                // ValuePattern alone isn't enough - many read-only elements expose it
-                if let Ok(value_pattern) = element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) {
-                    // Check if it's read-only
-                    if let Ok(is_readonly) = value_pattern.CurrentIsReadOnly() {
-                        if is_readonly.as_bool() {
-                            info!("Skipping: ValuePattern element is read-only");
-                            return false;
-                        }
-                    }
-                    // Not read-only, accept it
-                    info!("Accepting: Writable ValuePattern element");
-                    return true;
-                }
-                
-                // 4. TextPattern is NOT sufficient alone (read-only text areas have it)
-                // Only accept TextPattern if the element also looks like an input
-                if element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId).is_ok() {
-                    // Must have additional evidence of being editable
-                    if name_lower.contains("edit") || name_lower.contains("input") || 
-                       name_lower.contains("text box") || name_lower.contains("textarea") ||
-                       class_name.to_lowercase().contains("edit") {
-                        info!("Accepting: TextPattern with edit-like name/class");
-                        return true;
-                    }
-                    info!("Skipping: TextPattern without edit evidence (likely read-only text)");
-                    return false;
-                }
-
-                // 5. Name-based detection for rich editors (last resort)
-                if name_lower.contains("rich text") || 
-                   name_lower.contains("compose") ||
-                   name_lower.contains("message body") {
-                    info!("Accepting: Rich editor by name heuristic");
-                    return true;
-                }
-                
-                // Default: reject unknown elements
-                info!("Skipping: No evidence of text input capability");
-                false
             }
         }
+
+        // ============================================================
+        // Low-level injection methods
+        // ============================================================
 
         fn inject_keyboard_unicode(&self, text: &str) -> Result<()> {
             use windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_UNICODE;

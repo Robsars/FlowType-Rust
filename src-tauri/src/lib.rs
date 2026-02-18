@@ -107,7 +107,6 @@ fn run_engine_loop(app: AppHandle) -> Result<()> {
 
             // Check punctuation filtering EARLY (before display and injection)
             let punctuations_disabled = disable_punctuation_clone.load(std::sync::atomic::Ordering::Relaxed);
-            info!("🔧 Punctuation filter state: {} (text before filter: '{}')", punctuations_disabled, text);
             if punctuations_disabled {
                 // Replace punctuation with spaces (to maintain word separation)
                 text = text.chars()
